@@ -450,6 +450,7 @@ class Test_CommitBatch:
         )
 
     @staticmethod
+    @pytest.mark.usefixtures("runstate")
     def test_commit_callback_exception():
         future1, future2 = tasklets.Future(), tasklets.Future()
         batch = _api._CommitBatch({})
@@ -464,6 +465,7 @@ class Test_CommitBatch:
         assert future2.exception() is error
 
     @staticmethod
+    @pytest.mark.usefixtures("runstate")
     def test_commit_callback():
         future1, future2 = tasklets.Future(), tasklets.Future()
         batch = _api._CommitBatch({})

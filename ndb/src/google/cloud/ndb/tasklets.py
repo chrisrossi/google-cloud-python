@@ -18,11 +18,13 @@ Tasklets are a way to write concurrently running functions without
 threads.
 """
 import functools
+import logging
 import types
 
 import grpc
 
 from google.cloud.ndb import _eventloop
+from google.cloud.ndb import _runstate
 
 __all__ = [
     "add_flow_exception",
@@ -43,6 +45,8 @@ __all__ = [
     "wait_any",
 ]
 
+log = logging.getLogger(__name__)
+
 
 class Future:
     """Represents a task to be completed at an unspecified time in the future.
@@ -54,12 +58,16 @@ class Future:
     Provides interface defined by :class:`concurrent.futures.Future` as well as
     that of the legacy Google App Engine NDB ``Future`` class.
     """
+    purpose = "Unknown"
 
-    def __init__(self):
+    def __init__(self, purpose=None):
         self._done = False
         self._result = None
         self._callbacks = []
         self._exception = None
+
+        if purpose is not None:
+            self.purpose = purpose
 
     def done(self):
         """Get whether future has finished its task.
@@ -235,30 +243,46 @@ class _TaskletFuture(Future):
             generator.
     """
 
-    def __init__(self, generator):
-        super(_TaskletFuture, self).__init__()
+    def __init__(self, generator, context, purpose="tasklet"):
+        super(_TaskletFuture, self).__init__(purpose=purpose)
         self.generator = generator
+        self.context = context
 
     def _advance_tasklet(self, send_value=None, error=None):
         """Advance a tasklet one step by sending in a value or error."""
+        parent = _runstate.current()
+        _runstate.states.push(self.context)
+
         try:
             # Send the next value or exception into the generator
             if error:
+                log.debug("sending error into %s", self.purpose)
                 self.generator.throw(type(error), error)
 
             # send_value will be None if this is the first time
+            log.debug("sending value into %s", self.purpose)
             yielded = self.generator.send(send_value)
+            log.debug("yield value from %s", self.purpose)
 
         except StopIteration as stop:
             # Generator has signalled exit, get the return value. This tasklet
             # has finished.
+            log.debug("finished tasklet: %s", self.purpose)
             self.set_result(_get_return_value(stop))
             return
 
         except Exception as error:
             # An error has occurred in the tasklet. This tasklet has finished.
+            log.debug("exception in tasklet: %s", self.purpose)
             self.set_exception(error)
             return
+
+        finally:
+            context = _runstate.states.pop()
+            if (context is not self.context or
+                    _runstate.current() is not parent):
+                # If we did this right, this won't ever happen
+                raise RuntimeError("Corrupted context stack.")
 
         # This tasklet has yielded a value. We expect this to be a future
         # object (either NDB or gRPC) or a sequence of futures, in the case of
@@ -280,10 +304,12 @@ class _TaskletFuture(Future):
             else:
                 self._advance_tasklet(yielded.result())
 
+        from google.cloud.ndb import _datastore_api  # avoid circular import
+
         if isinstance(yielded, Future):
             yielded.add_done_callback(done_callback)
 
-        elif isinstance(yielded, grpc.Future):
+        elif isinstance(yielded, _datastore_api.RPC):
             _eventloop.queue_rpc(yielded, done_callback)
 
         elif isinstance(yielded, (list, tuple)):
@@ -342,6 +368,12 @@ class _MultiFuture(Future):
             result = tuple((future.result() for future in self._dependencies))
             self.set_result(result)
 
+    @property
+    def purpose(self):
+        return "MultiFuture({})".format(", ".join((
+            future.purpose for future in self._dependencies
+        )))
+
 
 def tasklet(wrapped):
     """
@@ -377,12 +409,13 @@ def tasklet(wrapped):
 
         if isinstance(returned, types.GeneratorType):
             # We have a tasklet
-            future = _TaskletFuture(returned)
+            future = _TaskletFuture(returned, _runstate.current(),
+                                    purpose=wrapped.__name__)
             future._advance_tasklet()
 
         else:
             # We don't have a tasklet, but we fake it anyway
-            future = Future()
+            future = Future(purpose=wrapped.__name__)
             future.set_result(returned)
 
         return future
@@ -476,8 +509,23 @@ def set_context(*args, **kwargs):
     raise NotImplementedError
 
 
-def sleep(*args, **kwargs):
-    raise NotImplementedError
+def sleep(seconds):
+    """Sleep some amount of time in a tasklet.
+
+    Example:
+        ..code-block:: python
+
+            yield tasklets.sleep(0.5)  # Sleep for half a second.
+
+    Arguments:
+        seconds (float): Amount of time, in seconds, to sleep.
+
+    Returns:
+        Future: Future will be complete after ``seconds`` have elapsed.
+    """
+    future = Future(purpose="sleep({})".format(seconds))
+    _eventloop.queue_call(seconds, future.set_result, None)
+    return future
 
 
 def synctasklet(*args, **kwargs):

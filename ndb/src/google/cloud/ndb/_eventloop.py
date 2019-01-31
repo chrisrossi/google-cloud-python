@@ -18,6 +18,7 @@ This should handle both asynchronous ``ndb`` objects and arbitrary callbacks.
 """
 import collections
 import queue
+import logging
 import uuid
 import time
 
@@ -33,6 +34,8 @@ __all__ = [
     "run0",
     "run1",
 ]
+
+log = logging.getLogger(__name__)
 
 
 def _logging_debug(*args, **kw):
@@ -237,10 +240,18 @@ class EventLoop:
         queue when it has finished. The event loop consumes the synchronized
         queue and calls `callback` with the finished gRPC future.
         """
-        rpc_id = uuid.uuid1()
+        # Initially, this was a call to uuid.uuid1(), but it was found it could
+        # return the same uuid twice in a row, which is not what you'd expect
+        # in a universally unique identifier.
+        rpc_id = uuid.uuid4()
         self.rpcs[rpc_id] = callback
 
-        def rpc_callback(rpc):
+        log.debug("Queue RPC: %s: %s", rpc.name, rpc_id)
+        log.debug("rpcs after queue: %s", self.rpcs)
+
+        def rpc_callback(future):
+            log.debug("RPC Finished: %s: %s", rpc.name, rpc_id)
+            log.debug("rpcs at callback: %s", self.rpcs)
             self.rpc_results.put((rpc_id, rpc))
 
         rpc.add_done_callback(rpc_callback)
@@ -331,6 +342,7 @@ class EventLoop:
             # result on the queue. Functionally equivalent to the ``wait_any``
             # call that was used here in legacy NDB.
             rpc_id, rpc = self.rpc_results.get()
+            log.debug("Processing RPC: %s: %s", rpc.name, rpc_id)
 
             callback = self.rpcs.pop(rpc_id)
             callback(rpc)
